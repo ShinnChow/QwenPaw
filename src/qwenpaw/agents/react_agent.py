@@ -64,6 +64,7 @@ class QwenPawAgent(CodingModeMixin, Agent):
         memory_manager: "BaseMemoryManager | None" = None,
         context_manager: "BaseContextManager | None" = None,
         effective_skills: Optional[list[str]] = None,
+        governor: Any = None,
     ):
         """Initialize QwenPawAgent.
 
@@ -79,6 +80,8 @@ class QwenPawAgent(CodingModeMixin, Agent):
         # Register skills metadata on toolkit
         self._register_skills(toolkit, effective_skills=effective_skills or [])
 
+        self._governor = governor
+
         # Store managers for downstream consumers
         self.memory_manager = memory_manager
         self.context_manager = context_manager
@@ -88,13 +91,24 @@ class QwenPawAgent(CodingModeMixin, Agent):
             memory_tools = self.memory_manager.list_memory_tools()
             basic_group = toolkit.tool_groups[0]
             for tool_fn in memory_tools:
-                basic_group.tools.append(
-                    GuardedFunctionTool(
-                        tool_fn,
-                        agent_id=self._agent_config.id,
-                        request_context=self._request_context,
-                    ),
-                )
+                if self._governor:
+                    from ..governance import PolicyGuardedTool
+
+                    basic_group.tools.append(
+                        PolicyGuardedTool(
+                            tool_fn,
+                            governor=self._governor,
+                            request_context=self._request_context,
+                        ),
+                    )
+                else:
+                    basic_group.tools.append(
+                        GuardedFunctionTool(
+                            tool_fn,
+                            agent_id=self._agent_config.id,
+                            request_context=self._request_context,
+                        ),
+                    )
             logger.debug(
                 "Registered memory tools: %s",
                 [fn.__name__ for fn in memory_tools],
@@ -174,6 +188,15 @@ class QwenPawAgent(CodingModeMixin, Agent):
             raise KeyError(
                 "state_dict has neither 'state' nor 'memory' key",
             )
+
+    async def close(self) -> None:
+        """Shut down governor (flush audit log, persist policy)."""
+        gov = getattr(self, "_governor", None)
+        if gov is not None:
+            try:
+                gov.stop()
+            except Exception:
+                logger.debug("governor stop failed", exc_info=True)
 
     def _register_skills(
         self,
